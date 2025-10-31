@@ -1,6 +1,12 @@
+//! This contract starts an auction when it receives an
+//! [NFT](https://github.com/near/NEPs/blob/master/neps/nep-0171.md)
+
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use near_contract_standards::non_fungible_token::approval::ext_nft_approval;
+use near_contract_standards::non_fungible_token::{
+    approval::{ext_nft_approval, NonFungibleTokenApprovalReceiver},
+    core::ext_nft_core,
+};
 use near_sdk::{env, near, require, store::IterableMap, AccountId, NearToken, Promise};
 
 #[near(serializers = [borsh])]
@@ -17,9 +23,9 @@ pub struct Auction {
     expiry: u64,
 }
 
-#[near(serializers = [borsh])]
+#[near(serializers = [borsh, json])]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct NFTId(u64);
+pub struct NFTId(u64);
 
 impl NFTId {
     pub fn new(nft: &AccountId, token_id: &TokenId) -> Self {
@@ -45,59 +51,79 @@ impl Default for Contract {
 
 type TokenId = String;
 
-// #[ext_contract(ext_nft)]
-// pub trait NonFungibleTokenCore {
-//     //approve an account ID to transfer a token on your behalf
-//     fn nft_approve(&mut self, token_id: TokenId, account_id: AccountId, msg: Option<String>);
-
-//     //check if the passed in account has access to approve the token ID
-//     fn nft_is_approved(
-//         &self,
-//         token_id: TokenId,
-//         approved_account_id: AccountId,
-//         approval_id: Option<u64>,
-//     ) -> bool;
-
-//     //revoke a specific account from transferring the token on your behalf
-//     fn nft_revoke(&mut self, token_id: TokenId, account_id: AccountId);
-
-//     //revoke all accounts from transferring the token on your behalf
-//     fn nft_revoke_all(&mut self, token_id: TokenId);
-// }
+#[near(serializers = [json])]
+pub struct AuctionParams {
+    timespan: u64,
+    minimum_bid: NearToken,
+}
 
 #[near]
-impl Contract {
-    #[payable]
-    pub fn start_auction(
+impl NonFungibleTokenApprovalReceiver for Contract {
+    fn nft_on_approve(
         &mut self,
-        nft: AccountId,
         token_id: TokenId,
-        timespan: u64,
-        minimum_bid: NearToken,
-    ) -> Promise {
+        owner_id: AccountId,
+        approval_id: u64,
+        msg: String,
+    ) -> near_sdk::PromiseOrValue<String> {
+        // Get Auction parameters
+        let nft = env::predecessor_account_id();
+        let AuctionParams {
+            timespan,
+            minimum_bid,
+        } = serde_json::from_str(&msg).expect("Invalid message");
+
         // Validations
         require!(timespan > 0, "timestamp must be greater than 0");
         let current_time = env::block_timestamp();
         let Some(expiry) = current_time.checked_add(timespan) else {
             env::panic_str("adding `timespan` to `timestamp` overflowed, `timespan` is too big")
         };
+        let nft_id = NFTId::new(&nft, &token_id);
 
         // Operations
-        let promise = ext_nft_approval::ext(nft.clone())
+        let promise = ext_nft_core::ext(nft)
             .with_attached_deposit(NearToken::from_yoctonear(1))
-            .nft_approve(token_id.clone(), env::current_account_id(), None)
-            .as_return();
+            .nft_transfer(
+                env::current_account_id(),
+                token_id,
+                Some(approval_id),
+                Some("Auction started".into()),
+            )
+            // TODO HERE: figure out conventions to call yourself
+            //
+            // maybe use:
+            // #[ext_contract(ext_nft_approval)]
+            .then(Self::ext(env::current_account_id()).start_auction(
+                owner_id,
+                nft_id,
+                expiry,
+                minimum_bid,
+            ));
+        near_sdk::PromiseOrValue::Promise(promise)
+    }
+}
+
+#[near]
+impl Contract {
+    #[private]
+    pub fn start_auction(
+        &mut self,
+        owner_id: AccountId,
+        nft_id: NFTId,
+        expiry: u64,
+        minimum_bid: NearToken,
+    ) {
         let auction = Auction {
-            owner: env::signer_account_id(),
+            owner: owner_id,
             bids: IterableMap::new(b"a"),
             h_bid: minimum_bid,
             expiry,
         };
-        let nft_id = NFTId::new(&nft, &token_id);
         self.auctions.insert(nft_id, auction);
-        promise
     }
 
+    #[payable]
     pub fn end_auction(&mut self, nft: AccountId, token_id: TokenId) -> Promise {
         // Validations
         let nft_id = NFTId::new(&nft, &token_id);
@@ -109,6 +135,7 @@ impl Contract {
             current_time >= auction.expiry,
             "cannot end, auction is still ongoing"
         );
+        // ext_nft_approval::ext(nft.clone()).nft_is_approved(token_id, approved_account_id, approval_id)
 
         // Operations
         let promise = match auction.bids.iter().last() {
@@ -116,6 +143,7 @@ impl Contract {
             Some((h_bidder, Bid { amount, paid: _ })) => {
                 // Transfer NFT to highest bidder
                 ext_nft_approval::ext(nft)
+                    .with_attached_deposit(NearToken::from_yoctonear(1))
                     .nft_approve(token_id, h_bidder.clone(), None)
                     .as_return()
                     .then(
@@ -145,6 +173,7 @@ impl Contract {
 
             // No bidders, Return NFT to owner
             None => ext_nft_approval::ext(nft)
+                .with_attached_deposit(env::attached_deposit()) // Pass through all attached deposit
                 .nft_approve(token_id, auction.owner.clone(), None)
                 .as_return(),
         };
@@ -186,6 +215,15 @@ impl Contract {
 
     pub fn len(&self) -> u32 {
         self.auctions.len()
+    }
+
+    pub fn expired(&self, nft: AccountId, token_id: TokenId) -> bool {
+        let nft_id = NFTId::new(&nft, &token_id);
+        let Some(auction) = self.auctions.get(&nft_id) else {
+            env::panic_str("this nft is not in auction")
+        };
+        let current_time = env::block_timestamp();
+        current_time >= auction.expiry
     }
 }
 
